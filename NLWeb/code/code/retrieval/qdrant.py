@@ -138,63 +138,94 @@ class QdrantVectorClient:
     async def _get_qdrant_client(self) -> AsyncQdrantClient:
         """
         Get or initialize Qdrant client.
-        
+
         Returns:
             AsyncQdrantClient: Qdrant client instance
         """
         client_key = self.endpoint_name
-        
-        # First check if we already have a client
+        print(f"[DEBUG] Requesting Qdrant client for endpoint key: '{client_key}'")
+
+        # Check if client already exists
         with self._client_lock:
             if client_key in self._qdrant_clients:
+                print(f"[DEBUG] Returning cached Qdrant client for '{client_key}'")
                 return self._qdrant_clients[client_key]
-        
-        # If not, create a new client (outside the lock to avoid deadlocks during async init)
+
         try:
-            logger.info(f"Initializing Qdrant client for endpoint: {self.endpoint_name}")
-            
+            print(f"[INFO] Initializing new Qdrant client for endpoint: '{client_key}'")
+
+            # Build client params with debug log
             params = self._create_client_params()
-            logger.debug(f"Qdrant client params: {params}")
-            
-            # Create client with the determined parameters
+            print(f"[DEBUG] Created client params (before adding verify): {params}")
+
+            # Add SSL verify disable flag explicitly
+            params['verify'] = False
+            params['timeout'] = 30
+            params['port'] = None
+            print(f"[DEBUG] Client params (after adding verify=False): {params}")
+
+            # Defensive check: log individual relevant fields too
+            url = params.get('url')
+            api_key = params.get('api_key')
+
+            print(f"[DEBUG] Endpoint URL: {url if url else 'N/A'}")
+            print(f"[DEBUG] API Key provided: {'YES' if api_key else 'NO'}")
+            if 'path' in params:
+                print(f"[DEBUG] Using local Qdrant path: {params['path']}")
+
+            # Instantiate the AsyncQdrantClient
+            print(f"[INFO] Instantiating AsyncQdrantClient with above parameters...")
             client = AsyncQdrantClient(**params)
-            
-            # Test connection by getting collections
+            print(f"[INFO] AsyncQdrantClient instance created.")
+
+            # Test connection: get collections
+            print(f"[INFO] Testing connection: fetching collections...")
             collections = await client.get_collections()
-            logger.debug(f"Available collections: {collections.collections}")
-            logger.info(f"Successfully initialized Qdrant client for {self.endpoint_name}")
-            
-            # Store in cache with lock
+            collection_names = [c.name for c in collections.collections]
+            print(f"[DEBUG] Collections retrieved from Qdrant: {collection_names}")
+
+            print(f"[INFO] Successfully initialized Qdrant client for endpoint '{client_key}'")
+
+            # Cache the client safely
             with self._client_lock:
                 self._qdrant_clients[client_key] = client
-            
+
             return client
-            
+
         except Exception as e:
-            logger.exception(f"Failed to initialize Qdrant client: {str(e)}")
-            
-            # If we failed with the URL endpoint, try a fallback to local file-based storage
-            if self.api_endpoint and "Connection refused" in str(e):
-                logger.info("Connection to Qdrant server failed, trying local file-based storage")
-                
-                # Create a default local client as fallback
-                logger.info("Creating default local client")
-                default_path = self._resolve_path("../data/db")
-                logger.info(f"Using default local path: {default_path}")
-                
-                fallback_client = AsyncQdrantClient(path=default_path)
-                
-                # Test connection
-                await fallback_client.get_collections()
-                
-                # Store in cache with lock
-                with self._client_lock:
-                    self._qdrant_clients[client_key] = fallback_client
-                
-                logger.info("Successfully created fallback local client")
-                return fallback_client
-            else:
-                raise
+            print(f"[ERROR] Exception while initializing Qdrant client for '{client_key}': {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Check for connection refused error and fallback
+            error_msg = str(e).lower() if e else ""
+            if self.api_endpoint and ("connection refused" in error_msg or "connectionerror" in error_msg):
+                print(f"[WARNING] Connection to Qdrant endpoint failed; attempting fallback to local client")
+
+                try:
+                    # Resolve default local path
+                    default_path = self._resolve_path("../data/db")
+                    print(f"[DEBUG] Resolving fallback local client path: {default_path}")
+
+                    fallback_client = AsyncQdrantClient(path=default_path)
+                    print(f"[INFO] Created fallback AsyncQdrantClient using local path.")
+                    print(f"[INFO] Testing fallback client: fetching collections...")
+                    await fallback_client.get_collections()
+                    print(f"[INFO] Successfully initialized fallback local Qdrant client")
+
+                    with self._client_lock:
+                        self._qdrant_clients[client_key] = fallback_client
+
+                    return fallback_client
+
+                except Exception as fallback_error:
+                    print(f"[ERROR] Fallback to local Qdrant client failed: {fallback_error}")
+                    traceback.print_exc()
+                    raise fallback_error
+
+            # Raise original if fallback is not applicable or fails
+            raise
+
     
     async def collection_exists(self, collection_name: Optional[str] = None) -> bool:
         """
